@@ -1,0 +1,19 @@
+# Render config for the HireLab MCP connector (a SEPARATE service from your ATS).
+services:
+  - type: web
+    name: hirelab-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mcp_server.py
+    envVars:
+      - key: ATS_BASE_URL
+        sync: false      # set in dashboard, e.g. https://hirelabscreener.onrender.com
+      - key: ATS_USERNAME
+        sync: false
+      - key: ATS_PASSWORD
+        sync: false
+      - key: MCP_SECRET
+        sync: false      # any long random string
+      - key: MCP_ALLOW_WRITES
+        value: "true"    # set "false" for read-only mode
