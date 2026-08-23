@@ -59,10 +59,17 @@ own login. It must belong to your company so it sees your data.
 
 ### 3. Add it to Claude
 - Claude.ai → Settings → Connectors → **Add custom connector**.
-- URL: `https://<your-mcp-service>.onrender.com/<MCP_SECRET>/mcp`
-  (the same MCP_SECRET you set above, in the path).
-- Save. Then in a chat, open the connectors menu and enable it.
-- Ask Claude: *"List my open mandates"* — it should call `list_mandates`.
+- Name: `HireLab Screener`
+- URL: `https://<your-mcp-service>.onrender.com/mcp`   ← just `/mcp`, no secret in the URL.
+- Leave OAuth Client ID / Secret **blank**. Click **Add**.
+- Claude will open a small **"Connect HireLab Screener"** page — enter your `MCP_SECRET`
+  there once and click Authorize. Claude is now connected.
+- In a chat, open the connectors menu, enable it, and ask: *"List my open mandates."*
+
+Why the secret page? claude.ai's web connector flow requires an OAuth sign-in
+step even for personal servers, so the connector performs a lightweight OAuth
+handshake. Your `MCP_SECRET` is the one-time "sign in". Tokens last 30 days;
+changing `MCP_SECRET` instantly revokes access.
 
 ## Security notes
 - The MCP endpoint is hidden behind your secret path; without it, requests get 404.

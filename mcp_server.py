@@ -32,12 +32,18 @@ stable across SDK releases.
 
 import os
 import json
+import time
+import hmac
+import base64
+import hashlib
+import secrets
 import threading
+from urllib.parse import urlencode
 
 import httpx
 from starlette.applications import Starlette
 from starlette.routing import Route
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, HTMLResponse, RedirectResponse, PlainTextResponse
 
 # ── Config ──────────────────────────────────────────────────────────────────
 ATS_BASE_URL = (os.environ.get("ATS_BASE_URL") or "").rstrip("/")
@@ -485,17 +491,169 @@ def _handle_rpc(msg):
     return _rpc_error(req_id, -32601, f"Method not found: {method}")
 
 
+# ── OAuth 2.1 shim ───────────────────────────────────────────────────────────
+# claude.ai's web connector flow currently requires an OAuth handshake even for
+# personal servers, so we implement a minimal, standards-shaped OAuth layer.
+# Security model: this is YOUR single-user tool. The "sign-in" step simply asks
+# for MCP_SECRET once; on success Claude receives a signed bearer token. All
+# codes/tokens are HMAC-signed with MCP_SECRET (no server-side state, so they
+# survive restarts; changing MCP_SECRET instantly revokes everything).
+
+def _b64u(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+def _b64u_dec(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+def _sign(kind: str, payload: dict) -> str:
+    raw = _b64u(json.dumps(payload, separators=(",", ":")).encode())
+    sig = _b64u(hmac.new(MCP_SECRET.encode(), f"{kind}:{raw}".encode(), hashlib.sha256).digest())
+    return f"{raw}.{sig}"
+
+def _verify(kind: str, token: str):
+    try:
+        raw, sig = token.split(".", 1)
+        expect = _b64u(hmac.new(MCP_SECRET.encode(), f"{kind}:{raw}".encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, expect):
+            return None
+        data = json.loads(_b64u_dec(raw))
+        if data.get("exp", 0) < time.time():
+            return None
+        return data
+    except Exception:
+        return None
+
+def _base_url(request):
+    if os.environ.get("PUBLIC_BASE_URL"):
+        return os.environ["PUBLIC_BASE_URL"].rstrip("/")
+    proto = request.headers.get("x-forwarded-proto", "https")
+    host = request.headers.get("host", request.url.hostname)
+    return f"{proto}://{host}"
+
+
+async def oauth_protected_resource(request):
+    base = _base_url(request)
+    return JSONResponse({
+        "resource": f"{base}/mcp",
+        "authorization_servers": [base],
+    })
+
+async def oauth_authorization_server(request):
+    base = _base_url(request)
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    })
+
+async def oauth_register(request):
+    # Dynamic Client Registration (RFC 7591). We accept any client.
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    client_id = "hirelab-" + secrets.token_hex(8)
+    return JSONResponse({
+        "client_id": client_id,
+        "redirect_uris": body.get("redirect_uris", []),
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    }, status_code=201)
+
+_AUTHORIZE_FORM = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize HireLab Screener</title>
+<style>body{{font-family:system-ui,Arial,sans-serif;background:#faf6f2;margin:0;
+display:flex;min-height:100vh;align-items:center;justify-content:center}}
+.card{{background:#fff;border:1px solid #e3c9b4;border-radius:12px;padding:28px 26px;max-width:380px;
+box-shadow:0 6px 24px rgba(120,60,20,.08)}}h1{{font-size:18px;color:#7a3b12;margin:0 0 6px}}
+p{{color:#6b5a50;font-size:13px;line-height:1.5;margin:0 0 16px}}
+input{{width:100%;padding:11px 12px;border:1px solid #d9b99f;border-radius:8px;font-size:14px;box-sizing:border-box}}
+button{{width:100%;margin-top:12px;padding:11px;background:#7a3b12;color:#fff;border:0;border-radius:8px;
+font-size:14px;font-weight:600;cursor:pointer}}.err{{color:#b3261e;font-size:12px;margin-top:8px}}</style></head>
+<body><form class="card" method="POST" action="/authorize">
+<h1>Connect HireLab Screener</h1>
+<p>Enter your connector secret to let Claude access your ATS. This is the MCP_SECRET you set in Render.</p>
+<input type="password" name="secret" placeholder="Connector secret" autofocus autocomplete="off">
+{hidden}{error}
+<button type="submit">Authorize</button></form></body></html>"""
+
+def _authorize_params(source):
+    keys = ("client_id", "redirect_uri", "state", "code_challenge",
+            "code_challenge_method", "response_type", "scope")
+    return {k: source.get(k, "") for k in keys if source.get(k, "")}
+
+async def oauth_authorize(request):
+    if request.method == "GET":
+        params = _authorize_params(request.query_params)
+        hidden = "".join(
+            f'<input type="hidden" name="{k}" value="{v}">' for k, v in params.items())
+        return HTMLResponse(_AUTHORIZE_FORM.format(hidden=hidden, error=""))
+
+    form = await request.form()
+    params = _authorize_params(form)
+    secret_ok = hmac.compare_digest((form.get("secret") or ""), MCP_SECRET) and bool(MCP_SECRET)
+    if not secret_ok:
+        hidden = "".join(
+            f'<input type="hidden" name="{k}" value="{v}">' for k, v in params.items())
+        return HTMLResponse(
+            _AUTHORIZE_FORM.format(hidden=hidden, error='<div class="err">Wrong secret. Try again.</div>'),
+            status_code=401)
+    redirect_uri = params.get("redirect_uri")
+    if not redirect_uri:
+        return PlainTextResponse("missing redirect_uri", status_code=400)
+    code = _sign("code", {
+        "cc": params.get("code_challenge", ""),
+        "exp": time.time() + 300,   # 5 min
+    })
+    q = {"code": code}
+    if params.get("state"):
+        q["state"] = params["state"]
+    sep = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(f"{redirect_uri}{sep}{urlencode(q)}", status_code=302)
+
+async def oauth_token(request):
+    form = await request.form()
+    code = form.get("code", "")
+    verifier = form.get("code_verifier", "")
+    data = _verify("code", code)
+    if not data:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    # PKCE S256 check
+    cc = data.get("cc", "")
+    if cc:
+        calc = _b64u(hashlib.sha256(verifier.encode()).digest())
+        if not hmac.compare_digest(calc, cc):
+            return JSONResponse({"error": "invalid_grant", "error_description": "PKCE failed"}, status_code=400)
+    access = _sign("token", {"exp": time.time() + 30 * 24 * 3600})   # 30 days
+    return JSONResponse({"access_token": access, "token_type": "Bearer", "expires_in": 30 * 24 * 3600})
+
+
+def _bearer_ok(request):
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return False
+    return _verify("token", auth[7:].strip()) is not None
+
+
 # ── HTTP endpoints ──────────────────────────────────────────────────────────
 async def mcp_endpoint(request):
-    # Secret path guard
-    if request.path_params.get("secret") != MCP_SECRET or not MCP_SECRET:
-        return Response("Not found", status_code=404)
+    if not _bearer_ok(request):
+        base = _base_url(request)
+        return JSONResponse(
+            {"error": "unauthorized"}, status_code=401,
+            headers={"WWW-Authenticate": f'Bearer resource_metadata="{base}/.well-known/oauth-protected-resource"'})
     try:
         body = await request.json()
     except Exception:
         return JSONResponse(_rpc_error(None, -32700, "Parse error"), status_code=400)
 
-    # A batch (list) or a single message
     if isinstance(body, list):
         responses = [r for r in (_handle_rpc(m) for m in body) if r is not None]
         if not responses:
@@ -504,7 +662,7 @@ async def mcp_endpoint(request):
 
     resp = _handle_rpc(body)
     if resp is None:
-        return Response(status_code=202)  # notification
+        return Response(status_code=202)
     return JSONResponse(resp)
 
 
@@ -512,12 +670,19 @@ async def health(request):
     ok = bool(ATS_BASE_URL and ATS_USERNAME and ATS_PASSWORD and MCP_SECRET)
     return JSONResponse({"status": "ok" if ok else "misconfigured",
                          "ats_url_set": bool(ATS_BASE_URL),
-                         "secret_set": bool(MCP_SECRET)})
+                         "secret_set": bool(MCP_SECRET),
+                         "writes_enabled": ALLOW_WRITES})
 
 
 app = Starlette(routes=[
     Route("/health", health, methods=["GET"]),
-    Route("/{secret}/mcp", mcp_endpoint, methods=["POST"]),
+    Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]),
+    Route("/.well-known/oauth-protected-resource/mcp", oauth_protected_resource, methods=["GET"]),
+    Route("/.well-known/oauth-authorization-server", oauth_authorization_server, methods=["GET"]),
+    Route("/register", oauth_register, methods=["POST"]),
+    Route("/authorize", oauth_authorize, methods=["GET", "POST"]),
+    Route("/token", oauth_token, methods=["POST"]),
+    Route("/mcp", mcp_endpoint, methods=["POST"]),
 ])
 
 
