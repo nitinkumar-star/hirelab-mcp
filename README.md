@@ -1,11 +1,15 @@
 # HireLab Screener — Personal MCP Connector
 
-Lets *your* Claude read from *your* HireLab Screener ATS. Read-only and safe: it
-logs in as a service account and calls your existing owner-scoped API, so all
-your tenant-isolation rules apply. Claude can search and read; it cannot edit or
-delete.
+Lets *your* Claude read from *your* HireLab Screener ATS. It logs in as a service
+account and calls your existing owner-scoped API, so all your tenant-isolation
+rules apply. Claude can read anything in the ATS (except secrets, backups and
+file downloads); actions are on only when `MCP_ALLOW_WRITES=true`.
 
-## What Claude can do (15 tools)
+> This file is kept in step with `mcp_server.py` in the `hirelabscreener` repo.
+> The ATS side of the "ask anything" tools (`/api/mcp/catalog`,
+> `/api/candidates/<id>/cv-text`) lives there.
+
+## What Claude can do (18 tools)
 
 **Read (always on)**
 | Tool | What it answers |
@@ -15,10 +19,13 @@ delete.
 | list_mandates | your open roles |
 | get_pipeline | candidates in a mandate + stage |
 | get_candidate | one candidate's full profile |
-| get_today_tasks | your action items |
+| get_candidate_cv | the candidate's CV as text, for analysis |
+| get_today_tasks | your action items (Tasks page) |
 | get_overview | business snapshot |
+| ats_catalog | finds where anything lives in the ATS (invoices, clients, e-mails, interviews, chat ... 260+ read-only routes) |
+| ats_read | reads any route from ats_catalog (read-only; secrets, backups and downloads are never listed) |
 
-**Write / Actions (on when `MCP_ALLOW_WRITES=true`, the default)**
+**Write / Actions (on only when `MCP_ALLOW_WRITES=true` is set)**
 | Tool | What it does | Confirmation |
 |---|---|---|
 | add_candidate | add a new candidate to a mandate | normal |
@@ -26,7 +33,7 @@ delete.
 | update_candidate | edit candidate fields (CTC, notice, feedback…) | Claude confirms (edits data) |
 | schedule_interview | schedule an interview round | normal |
 | add_tags | tag a candidate | normal |
-| create_task | add a to-do to the Command Center | normal |
+| create_task | add a to-do to the Tasks page | normal |
 | create_reminder | create a follow-up reminder | normal |
 | send_candidate_email | **send a real email** to a candidate | Claude confirms (sends email) |
 
@@ -54,7 +61,8 @@ own login. It must belong to your company so it sees your data.
   - `ATS_USERNAME`  = `claude-mcp`
   - `ATS_PASSWORD`  = that account's password
   - `MCP_SECRET`    = a long random string (e.g. 30+ characters). Keep it private.
-  - `MCP_ALLOW_WRITES` = `true` to allow actions (add/update/email), or `false` for read-only. Default `true`.
+  - `MCP_ALLOW_WRITES` = `true` to allow actions (add/update/email), or `false` for read-only. Default `false` (read-only) when not set.
+  - `MCP_REDIRECT_ALLOWLIST` (optional) = extra OAuth callback URLs, comma-separated. Only Claude's own callbacks are allowed by default.
 - Deploy. Check `https://<your-mcp-service>.onrender.com/health` returns `{"status":"ok"}`.
 
 ### 3. Add it to Claude
